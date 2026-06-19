@@ -52,10 +52,8 @@ The module expects configuration in vendor_data2.json under the nectar namespace
 - Installation failures are logged but don't halt boot by default
 """
 
-import json
 import logging
 import os
-import tempfile
 
 from cloudinit import subp, temp_utils, type_utils, url_helper, util
 from cloudinit.cloud import Cloud
@@ -342,8 +340,7 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
     # If no config found anywhere, skip silently
     if not cs_cfg:
         LOG.debug(
-            "Skipping module %s, no 'crowdstrike' key in vendor_data2 or config",
-            name
+            "Skipping module %s, no 'crowdstrike' key in vendor_data2 or config", name
         )
         return
 
@@ -364,15 +361,13 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
     if _is_falcon_installed():
         LOG.info(
             "CrowdStrike Falcon already installed at %s, skipping installation",
-            FALCON_INSTALLED_MARKER
+            FALCON_INSTALLED_MARKER,
         )
         return
 
     # Extract required configuration
     cid = util.get_cfg_option_str(cs_cfg, "cid", None)
-    fail_if_missing = util.get_cfg_option_bool(
-        cs_cfg, "fail_if_missing", default=False
-    )
+    fail_if_missing = util.get_cfg_option_bool(cs_cfg, "fail_if_missing", default=False)
 
     # An installer URL may be supplied generically (installer_url) or as
     # package-type-specific variants (installer_url_deb / installer_url_rpm).
@@ -399,7 +394,7 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
 
     LOG.info(
         "Starting CrowdStrike Falcon installation for CID: %s",
-        cid[:8] + "..." if len(cid) > 8 else cid
+        cid[:8] + "..." if len(cid) > 8 else cid,
     )
 
     try:
@@ -413,13 +408,12 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
             )
         LOG.debug(
             "Detected package type: %s, using installer URL: %s",
-            package_type, installer_url
+            package_type,
+            installer_url,
         )
 
         # Create temporary directory for download
-        with temp_utils.tempdir(
-            dir=cloud.distro.get_tmp_exec_path()
-        ) as tmpd:
+        with temp_utils.tempdir(dir=cloud.distro.get_tmp_exec_path()) as tmpd:
             # Download installer
             package_ext = "deb" if package_type == "deb" else "rpm"
             installer_path = os.path.join(tmpd, f"falcon-sensor.{package_ext}")
