@@ -1,0 +1,9 @@
+#cloud-config
+# Example user-data for testing the CrowdStrike module
+# This should only be used for testing - production should use vendor_data2.json
+
+crowdstrike:
+  cid: "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-XX"
+  installer_url: "https://secure.example.com/falcon/falcon-sensor-7.10.0-16003.deb"
+  enabled: true
+  fail_if_missing: false

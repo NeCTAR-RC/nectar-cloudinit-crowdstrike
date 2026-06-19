@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include config *.cfg
+recursive-include nectar_crowdstrike *.py

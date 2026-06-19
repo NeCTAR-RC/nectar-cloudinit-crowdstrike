@@ -1,0 +1,8 @@
+# No additional dependencies required
+# This module uses cloud-init's built-in libraries:
+# - cloudinit.subp
+# - cloudinit.url_helper
+# - cloudinit.util
+# - cloudinit.temp_utils
+#
+# Cloud-init itself is expected to be installed via system packages

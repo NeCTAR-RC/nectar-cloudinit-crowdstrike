@@ -1,0 +1,37 @@
+---
+# Simple Ansible tasks for including in your existing image build playbook
+#
+# Usage:
+#   - include_tasks: path/to/ansible-tasks.yml
+#
+# Or copy these tasks directly into your playbook
+
+- name: Ensure pip3 is installed
+  ansible.builtin.package:
+    name: python3-pip
+    state: present
+  become: true
+
+- name: Install nectar-cloudinit-crowdstrike module
+  ansible.builtin.pip:
+    name: "file://{{ playbook_dir }}/nectar-cloudinit-crowdstrike"
+    state: present
+    executable: pip3
+  become: true
+
+- name: Verify CrowdStrike module installation
+  ansible.builtin.stat:
+    path: /usr/lib/python3/dist-packages/cloudinit/config/cc_crowdstrike.py
+  register: crowdstrike_module
+  failed_when: not crowdstrike_module.stat.exists
+
+- name: Verify CrowdStrike config installation
+  ansible.builtin.stat:
+    path: /etc/cloud/cloud.cfg.d/99_crowdstrike.cfg
+  register: crowdstrike_config
+  failed_when: not crowdstrike_config.stat.exists
+
+- name: Test module import
+  ansible.builtin.command: python3 -c "from cloudinit.config import cc_crowdstrike"
+  changed_when: false
+  become: true
