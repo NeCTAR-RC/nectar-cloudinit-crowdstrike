@@ -34,6 +34,7 @@ def _install_fake_cloudinit():
     util.get_cfg_option_bool = get_cfg_option_bool
     util.write_file = mock.MagicMock()
     util.logexc = mock.MagicMock()
+    util.get_linux_distro = mock.MagicMock(return_value=("", "", ""))
 
     type_utils = types.ModuleType("cloudinit.type_utils")
     type_utils.obj_name = lambda obj: type(obj).__name__

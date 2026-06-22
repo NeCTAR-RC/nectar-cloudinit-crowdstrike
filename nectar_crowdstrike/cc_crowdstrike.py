@@ -14,6 +14,8 @@ The module expects configuration in vendor_data2.json under the nectar namespace
       "nectar": {
         "crowdstrike": {
           "cid": "XXXXXXXXXXXXXXXXXXXXXXXXXXXX-XX",
+          "provisioning_token": "XXXXXXXX",
+          "tags": "Unmanaged_External",
           "installer_url": "https://example.com/path/to/falcon-sensor.deb",
           "enabled": true,
           "fail_if_missing": false
@@ -25,6 +27,13 @@ The module expects configuration in vendor_data2.json under the nectar namespace
 
 - ``cid``: CrowdStrike Customer ID (required)
 - ``installer_url``: URL to download the Falcon sensor package (required)
+- ``installer_url_deb`` / ``installer_url_rpm``: package-type-specific URLs,
+  preferred over ``installer_url`` when present. An ``installer_url_rpm`` may
+  contain the ``{el_version}`` placeholder, which is replaced with the host's
+  Enterprise Linux major version (e.g. ``el9``) so one URL covers el8/el9/el10.
+- ``provisioning_token``: Provisioning token for registration (optional)
+- ``tags``: Comma-separated sensor grouping tags, e.g. ``Unmanaged_External``
+  (optional)
 - ``enabled``: Whether to install the sensor (default: true)
 - ``fail_if_missing``: Halt boot if installation fails (default: false)
 
@@ -42,7 +51,10 @@ The module expects configuration in vendor_data2.json under the nectar namespace
 - Runs in the cloud_final_modules stage
 - Executes on every boot (PER_ALWAYS)
 - Supports Ubuntu, Debian, RHEL, CentOS, and derivatives
-- Activated by presence of 'crowdstrike' key in vendor_data
+- Always activated (``activate_by_schema_keys`` is empty); the handler reads
+  vendor_data2 directly and returns early when no config is present. It cannot
+  be gated on the ``crowdstrike`` schema key because the production config is
+  nested under ``nectar.crowdstrike`` in vendor_data2, not a top-level key.
 
 **Security Notes:**
 
@@ -64,17 +76,32 @@ from cloudinit.settings import PER_ALWAYS
 LOG = logging.getLogger(__name__)
 
 # Module metadata
+#
+# ``activate_by_schema_keys`` is intentionally empty so the module ALWAYS runs.
+# Cloud-init's activation gate (cloudinit/config/modules.py:_is_active) only
+# matches activation keys against the *top-level* keys of the merged cloud
+# config (``cfg.keys()``). Our production config lives in vendor_data2 under
+# ``nectar.crowdstrike`` (nested, and not merged into ``cfg`` as a top-level
+# ``crowdstrike`` key), so a ``["crowdstrike"]`` gate would never match and the
+# module would silently never run in production. We instead always activate and
+# let ``handle()`` read vendor_data2 directly and return early when there is no
+# config. Do NOT re-add ``crowdstrike`` here.
 meta: MetaSchema = {
     "id": "cc_crowdstrike",
     "distros": [ALL_DISTROS],
     "frequency": PER_ALWAYS,
-    "activate_by_schema_keys": ["crowdstrike"],
+    "activate_by_schema_keys": [],
 }
 
 # Constants
 FALCON_SERVICE_NAME = "falcon-sensor"
 FALCONCTL_PATH = "/opt/CrowdStrike/falconctl"
 FALCON_INSTALLED_MARKER = "/opt/CrowdStrike"
+
+# Placeholder operators may use in an RPM installer URL to have the module
+# substitute the host's Enterprise Linux major version (e.g. el9). Lets a
+# single installer_url_rpm cover el8/el9/el10 without per-version config.
+EL_VERSION_PLACEHOLDER = "{el_version}"
 
 
 def _is_falcon_installed() -> bool:
@@ -154,6 +181,51 @@ def _select_installer_url(cs_cfg: dict, package_type: str) -> str:
     return util.get_cfg_option_str(cs_cfg, "installer_url", None)
 
 
+def _get_el_version() -> str:
+    """Return the Enterprise Linux major version (e.g. '9') for this host.
+
+    Reads ``VERSION_ID`` from ``/etc/os-release`` via cloud-init's
+    ``get_linux_distro`` and returns the leading major-version component.
+
+    Returns:
+        The EL major version as a string, or None if it cannot be determined
+    """
+    try:
+        _name, version, _flavor = util.get_linux_distro()
+    except Exception as e:
+        LOG.warning("Could not determine Linux distro version: %s", e)
+        return None
+
+    if not version:
+        return None
+
+    major = version.split(".")[0].strip()
+    return major if major.isdigit() else None
+
+
+def _resolve_el_version_in_url(url: str) -> str:
+    """Substitute the EL-version placeholder in an installer URL.
+
+    Args:
+        url: Installer URL, possibly containing ``{el_version}``
+
+    Returns:
+        - The URL unchanged if it has no placeholder
+        - The URL with ``{el_version}`` replaced by the detected EL major
+          version
+        - None if the placeholder is present but the EL version cannot be
+          determined (caller should skip installation)
+    """
+    if EL_VERSION_PLACEHOLDER not in url:
+        return url
+
+    el_version = _get_el_version()
+    if not el_version:
+        return None
+
+    return url.replace(EL_VERSION_PLACEHOLDER, el_version)
+
+
 def _download_installer(url: str, dest_path: str) -> None:
     """Download the Falcon installer from the provided URL.
 
@@ -220,11 +292,19 @@ def _install_package(distro, package_path: str, package_type: str) -> None:
         raise RuntimeError(msg) from e
 
 
-def _configure_falcon(cid: str) -> None:
+def _configure_falcon(
+    cid: str, provisioning_token: str = None, tags: str = None
+) -> None:
     """Configure Falcon sensor with the provided CID.
+
+    Registers the sensor with the CID (and provisioning token, if supplied)
+    in a single ``falconctl`` call, mirroring the provider's documented
+    process. Tags, when supplied, are applied in a separate call.
 
     Args:
         cid: CrowdStrike Customer ID
+        provisioning_token: Provisioning token for registration (optional)
+        tags: Sensor grouping tags, comma-separated (optional)
 
     Raises:
         RuntimeError: If configuration fails
@@ -237,10 +317,20 @@ def _configure_falcon(cid: str) -> None:
     LOG.info("Configuring CrowdStrike Falcon with CID")
 
     try:
-        # Set the CID
+        # Set the CID, and the provisioning token in the same call when present
         cmd = [FALCONCTL_PATH, "-s", f"--cid={cid}"]
+        if provisioning_token:
+            cmd.append(f"--provisioning-token={provisioning_token}")
         subp.subp(cmd, capture=True)
-        LOG.debug("Successfully set CID")
+        LOG.debug(
+            "Successfully set CID%s",
+            " and provisioning token" if provisioning_token else "",
+        )
+
+        # Apply tags in a separate call (provider documents this separately)
+        if tags:
+            subp.subp([FALCONCTL_PATH, "-s", f"--tags={tags}"], capture=True)
+            LOG.debug("Successfully set tags: %s", tags)
 
     except subp.ProcessExecutionError as e:
         msg = f"Failed to configure CrowdStrike Falcon: {e}"
@@ -367,6 +457,8 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
 
     # Extract required configuration
     cid = util.get_cfg_option_str(cs_cfg, "cid", None)
+    provisioning_token = util.get_cfg_option_str(cs_cfg, "provisioning_token", None)
+    tags = util.get_cfg_option_str(cs_cfg, "tags", None)
     fail_if_missing = util.get_cfg_option_bool(cs_cfg, "fail_if_missing", default=False)
 
     # An installer URL may be supplied generically (installer_url) or as
@@ -406,6 +498,20 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
                 "No CrowdStrike installer URL available for package type "
                 f"'{package_type}'"
             )
+
+        # Resolve any {el_version} placeholder (RPM installs on EL hosts).
+        # An unresolvable EL version is always non-fatal: skip with a warning
+        # even when fail_if_missing is set.
+        resolved_url = _resolve_el_version_in_url(installer_url)
+        if resolved_url is None:
+            LOG.warning(
+                "CrowdStrike installer URL '%s' requires an EL version that "
+                "could not be determined for this host - skipping installation",
+                installer_url,
+            )
+            return
+        installer_url = resolved_url
+
         LOG.debug(
             "Detected package type: %s, using installer URL: %s",
             package_type,
@@ -422,8 +528,8 @@ def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:
             # Install package
             _install_package(cloud.distro, installer_path, package_type)
 
-        # Configure with CID
-        _configure_falcon(cid)
+        # Configure with CID (plus provisioning token and tags when provided)
+        _configure_falcon(cid, provisioning_token, tags)
 
         # Start the service
         _start_falcon_service(cloud.distro)

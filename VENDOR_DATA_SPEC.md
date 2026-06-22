@@ -39,8 +39,38 @@ The CrowdStrike module expects configuration in the following nested structure w
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `installer_url_deb` | string | - | DEB-specific download URL, preferred over `installer_url` on Debian/Ubuntu hosts |
+| `installer_url_rpm` | string | - | RPM-specific download URL, preferred over `installer_url` on EL hosts. May contain the `{el_version}` placeholder (see below) |
+| `provisioning_token` | string | - | Provisioning token passed to `falconctl` alongside the CID during registration |
+| `tags` | string | - | Comma-separated sensor grouping tags (e.g. `Unmanaged_External`) |
 | `enabled` | boolean | `true` | Whether to install the sensor (useful for testing/rollback) |
 | `fail_if_missing` | boolean | `false` | Halt boot if installation fails (fail-closed behavior) |
+
+### EL Version Templating (RPM)
+
+CrowdStrike ships a separate RPM per Enterprise Linux major version (el8, el9,
+el10, ...). Rather than storing one Vault entry per version, put the
+`{el_version}` placeholder in `installer_url_rpm`. At install time the module
+reads the host's `VERSION_ID` from `/etc/os-release` and substitutes the major
+version:
+
+```json
+{
+  "nectar": {
+    "crowdstrike": {
+      "cid": "1234567890ABCDEF1234567890ABCD-12",
+      "installer_url_rpm": "https://packages.example.com/falcon-sensor-7.36.0-18909.el{el_version}.x86_64.rpm"
+    }
+  }
+}
+```
+
+On a Rocky/Alma/RHEL 9 host this resolves to `...el9.x86_64.rpm`; on a version
+8 host, `...el8.x86_64.rpm`.
+
+If the EL major version cannot be determined (for example a non-numeric
+`VERSION_ID`), the module logs a warning and skips installation. This skip is
+**always non-fatal**, even when `fail_if_missing` is `true`.
 
 ## Examples
 
@@ -64,6 +94,8 @@ The CrowdStrike module expects configuration in the following nested structure w
   "nectar": {
     "crowdstrike": {
       "cid": "1234567890ABCDEF1234567890ABCD-12",
+      "provisioning_token": "ABCDEF12",
+      "tags": "Unmanaged_External",
       "installer_url": "https://packages.example.com/falcon-sensor-7.10.0.deb",
       "enabled": true,
       "fail_if_missing": false
@@ -120,6 +152,8 @@ def provide_vendor_data(context):
             'crowdstrike': {
                 'cid': secrets['cid'],
                 'installer_url': secrets['installer_url'],
+                'provisioning_token': secrets.get('provisioning_token'),
+                'tags': secrets.get('tags'),
                 'enabled': secrets.get('enabled', True),
                 'fail_if_missing': secrets.get('fail_if_missing', False)
             }
@@ -141,6 +175,8 @@ Store secrets in Vault at `secret/crowdstrike/{availability_zone}`:
 ```json
 {
   "cid": "1234567890ABCDEF1234567890ABCD-12",
+  "provisioning_token": "ABCDEF12",
+  "tags": "Unmanaged_External",
   "installer_url": "https://packages.internal.nectar.org.au/crowdstrike/falcon-sensor-7.10.0-16003.deb",
   "enabled": true,
   "fail_if_missing": false
@@ -153,6 +189,8 @@ Store secrets in Vault at `secret/crowdstrike/{availability_zone}`:
 # Set CrowdStrike secrets for an availability zone
 vault kv put secret/crowdstrike/melbourne-qh2 \
   cid="1234567890ABCDEF1234567890ABCD-12" \
+  provisioning_token="ABCDEF12" \
+  tags="Unmanaged_External" \
   installer_url="https://packages.internal.nectar.org.au/crowdstrike/falcon-sensor.deb" \
   enabled=true \
   fail_if_missing=false

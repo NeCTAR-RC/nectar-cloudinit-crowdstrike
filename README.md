@@ -123,6 +123,9 @@ The module will also check the top-level `crowdstrike` key for backwards compati
 |-----|------|----------|---------|-------------|
 | `cid` | string | Yes | - | CrowdStrike Customer ID for sensor registration |
 | `installer_url` | string | Yes | - | HTTPS URL to download Falcon sensor package (.deb or .rpm) |
+| `installer_url_deb` / `installer_url_rpm` | string | No | - | Package-type-specific URLs, preferred over `installer_url` when present. `installer_url_rpm` may include the `{el_version}` placeholder (replaced with the host's EL major version, e.g. `el9`) so one URL covers el8/el9/el10 |
+| `provisioning_token` | string | No | - | Provisioning token passed to `falconctl` alongside the CID during registration |
+| `tags` | string | No | - | Comma-separated sensor grouping tags (e.g. `Unmanaged_External`) |
 | `enabled` | boolean | No | `true` | Enable/disable installation (for testing/rollback) |
 | `fail_if_missing` | boolean | No | `false` | Halt boot if installation fails (fail-closed behavior) |
 
@@ -153,6 +156,17 @@ The module runs in the `cloud_final_modules` stage, after:
 - Package repositories are configured
 - System is fully initialized
 
+### Activation
+
+The module sets `activate_by_schema_keys` to an **empty list**, so it is always
+activated. This is deliberate: cloud-init only matches activation keys against
+the *top-level* keys of the merged cloud config, and the production config is
+nested under `nectar.crowdstrike` in `vendor_data2.json`. A `crowdstrike`
+activation key would never match, so the module would silently never run in
+production. Instead it always runs and reads `vendor_data2` directly, returning
+early when no config is present. **Do not re-add a `crowdstrike` activation
+key** or production deployments will stop installing the sensor.
+
 ### Execution Frequency
 
 The module runs on **every boot** (`PER_ALWAYS`), but includes logic to skip if already installed:
@@ -166,7 +180,7 @@ The module runs on **every boot** (`PER_ALWAYS`), but includes logic to skip if 
 3. **Detect package type** - Determine .deb vs .rpm based on distro
 4. **Download installer** - Fetch from URL with 5 retries, 300s timeout
 5. **Install package** - Use dpkg/rpm and fix dependencies
-6. **Configure sensor** - Set CID using `/opt/CrowdStrike/falconctl`
+6. **Configure sensor** - Set CID (and provisioning token, if supplied) using `/opt/CrowdStrike/falconctl`, then apply any tags
 7. **Start service** - Enable and start `falcon-sensor.service`
 8. **Log results** - All steps logged to `/var/log/cloud-init.log`
 

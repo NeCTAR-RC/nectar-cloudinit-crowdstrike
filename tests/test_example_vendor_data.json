@@ -5,6 +5,8 @@
     },
     "crowdstrike": {
       "cid": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX-XX",
+      "provisioning_token": "XXXXXXXX",
+      "tags": "Unmanaged_External",
       "installer_url": "https://secure.example.com/falcon/falcon-sensor-7.10.0-16003.deb",
       "enabled": true,
       "fail_if_missing": false
