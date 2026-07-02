@@ -1,5 +1,9 @@
 """Unit tests for the cc_crowdstrike cloud-init module."""
 
+import contextlib
+import copy
+from email.mime.multipart import MIMEMultipart
+import json
 from unittest import mock
 
 import testtools
@@ -13,6 +17,9 @@ class FakeDistro:
     def __init__(self, name="ubuntu", osfamily="debian"):
         self.name = name
         self.osfamily = osfamily
+
+    def get_tmp_exec_path(self):
+        return "/tmp"
 
 
 class GetPackageTypeTest(testtools.TestCase):
@@ -191,3 +198,208 @@ class ConfigureFalconTest(testtools.TestCase):
     @mock.patch.object(cc_crowdstrike.os.path, "exists", return_value=True)
     def test_raises_runtimeerror_on_subp_failure(self, m_exists, m_subp):
         self.assertRaises(RuntimeError, cc_crowdstrike._configure_falcon, "CID-12")
+
+
+# --- Fixtures for the vendor_data2 read path and handle() ------------------
+
+# A realistic vendor_data2.json as delivered by Nova dynamic vendordata: the
+# nova-pollinate payload keyed under "crowdstrike" and nested by Nova under the
+# "nectar" dynamic-vendordata target name.
+NECTAR_DOC = {
+    "nectar": {
+        "crowdstrike": {
+            "cid": "CID-123",
+            "installer_url_deb": "https://example.com/falcon.deb",
+            "installer_url_rpm": "https://example.com/falcon.el{el_version}.rpm",
+            "provisioning_token": "TOK-9",
+            "tags": "MRC_VM",
+            "enabled": True,
+            "fail_if_missing": False,
+        }
+    }
+}
+
+
+class FakeUrlParams:
+    def __init__(self, timeout_seconds=5, num_retries=2):
+        self.timeout_seconds = timeout_seconds
+        self.num_retries = num_retries
+
+
+class FakeResponse:
+    """Stand-in for url_helper.UrlResponse (only .contents is read)."""
+
+    def __init__(self, contents):
+        self.contents = contents
+
+
+class FakeDataSource:
+    """Datasource stand-in exposing only what the module reads."""
+
+    def __init__(self, metadata_address="http://169.254.169.254"):
+        self.metadata_address = metadata_address
+
+    def get_url_params(self):
+        return FakeUrlParams()
+
+    def get_vendordata2(self):
+        # cloud-init returns the *processed* vendordata here: a MIME message,
+        # never a dict. Present so any regression that reads this instead of
+        # the raw JSON is caught (a MIMEMultipart carries no config).
+        return MIMEMultipart()
+
+
+class FakeCloud:
+    def __init__(self, datasource=None, distro=None):
+        self.datasource = datasource or FakeDataSource()
+        self.distro = distro or FakeDistro()
+
+
+@contextlib.contextmanager
+def _fake_tempdir(*args, **kwargs):
+    yield "/tmp/fake-crowdstrike"
+
+
+class FetchVendorData2Test(testtools.TestCase):
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_fetches_and_parses_json(self, m_readurl):
+        m_readurl.return_value = FakeResponse(json.dumps(NECTAR_DOC).encode())
+        self.assertEqual(NECTAR_DOC, cc_crowdstrike._fetch_vendordata2(FakeCloud()))
+
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_builds_url_from_datasource_metadata_address(self, m_readurl):
+        m_readurl.return_value = FakeResponse(b"{}")
+        cloud = FakeCloud(FakeDataSource(metadata_address="http://10.0.0.1:80"))
+        cc_crowdstrike._fetch_vendordata2(cloud)
+        self.assertEqual(
+            "http://10.0.0.1:80/openstack/latest/vendor_data2.json",
+            m_readurl.call_args.kwargs["url"],
+        )
+
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_falls_back_to_default_url_when_address_absent(self, m_readurl):
+        m_readurl.return_value = FakeResponse(b"{}")
+        cloud = FakeCloud(FakeDataSource(metadata_address=None))
+        cc_crowdstrike._fetch_vendordata2(cloud)
+        self.assertEqual(
+            cc_crowdstrike.DEFAULT_METADATA_URL + "/openstack/latest/vendor_data2.json",
+            m_readurl.call_args.kwargs["url"],
+        )
+
+    @mock.patch.object(
+        cc_crowdstrike.url_helper, "readurl", side_effect=Exception("boom")
+    )
+    def test_returns_empty_on_fetch_error(self, m_readurl):
+        self.assertEqual({}, cc_crowdstrike._fetch_vendordata2(FakeCloud()))
+
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_returns_empty_on_invalid_json(self, m_readurl):
+        m_readurl.return_value = FakeResponse(b"not json")
+        self.assertEqual({}, cc_crowdstrike._fetch_vendordata2(FakeCloud()))
+
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_returns_empty_on_non_object_json(self, m_readurl):
+        # A JSON array is valid JSON but load_json enforces a dict root.
+        m_readurl.return_value = FakeResponse(b"[1, 2, 3]")
+        self.assertEqual({}, cc_crowdstrike._fetch_vendordata2(FakeCloud()))
+
+
+class GetVendorDataConfigTest(testtools.TestCase):
+    @mock.patch.object(cc_crowdstrike, "_fetch_vendordata2")
+    def test_extracts_nested_nectar_crowdstrike(self, m_fetch):
+        m_fetch.return_value = copy.deepcopy(NECTAR_DOC)
+        self.assertEqual(
+            NECTAR_DOC["nectar"]["crowdstrike"],
+            cc_crowdstrike._get_vendor_data_config(FakeCloud()),
+        )
+
+    @mock.patch.object(cc_crowdstrike, "_fetch_vendordata2")
+    def test_extracts_top_level_crowdstrike(self, m_fetch):
+        m_fetch.return_value = {"crowdstrike": {"cid": "X"}}
+        self.assertEqual(
+            {"cid": "X"},
+            cc_crowdstrike._get_vendor_data_config(FakeCloud()),
+        )
+
+    @mock.patch.object(cc_crowdstrike, "_fetch_vendordata2")
+    def test_returns_empty_when_crowdstrike_absent(self, m_fetch):
+        m_fetch.return_value = {"nectar": {"something_else": 1}}
+        self.assertEqual({}, cc_crowdstrike._get_vendor_data_config(FakeCloud()))
+
+    @mock.patch.object(cc_crowdstrike, "_fetch_vendordata2")
+    def test_returns_empty_when_document_empty(self, m_fetch):
+        m_fetch.return_value = {}
+        self.assertEqual({}, cc_crowdstrike._get_vendor_data_config(FakeCloud()))
+
+    @mock.patch.object(cc_crowdstrike.url_helper, "readurl")
+    def test_config_found_although_get_vendordata2_returns_mime(self, m_readurl):
+        # The regression this whole change fixes: the datasource's processed
+        # accessor yields a MIME message (not a dict), yet the config is still
+        # found because we read the raw metadata document instead.
+        m_readurl.return_value = FakeResponse(json.dumps(NECTAR_DOC).encode())
+        cloud = FakeCloud()
+        self.assertNotIsInstance(cloud.datasource.get_vendordata2(), dict)
+        self.assertEqual(
+            NECTAR_DOC["nectar"]["crowdstrike"],
+            cc_crowdstrike._get_vendor_data_config(cloud),
+        )
+
+
+class HandleTest(testtools.TestCase):
+    """End-to-end regression: vendor_data2 document -> install path."""
+
+    def _run_handle(self, doc, distro=None):
+        cloud = FakeCloud(distro=distro)
+        with (
+            mock.patch.object(cc_crowdstrike, "_fetch_vendordata2", return_value=doc),
+            mock.patch.object(
+                cc_crowdstrike, "_is_falcon_installed", return_value=False
+            ),
+            mock.patch.object(cc_crowdstrike, "_download_installer") as m_dl,
+            mock.patch.object(cc_crowdstrike, "_install_package") as m_inst,
+            mock.patch.object(cc_crowdstrike, "_configure_falcon") as m_conf,
+            mock.patch.object(cc_crowdstrike, "_start_falcon_service") as m_start,
+            mock.patch.object(cc_crowdstrike.temp_utils, "tempdir", _fake_tempdir),
+        ):
+            cc_crowdstrike.handle("crowdstrike", {}, cloud, [])
+        return {
+            "download": m_dl,
+            "install": m_inst,
+            "configure": m_conf,
+            "start": m_start,
+        }
+
+    def test_installs_and_configures_from_vendordata2(self):
+        mocks = self._run_handle(copy.deepcopy(NECTAR_DOC))
+        # cid, provisioning token and tags all flow through from the document.
+        mocks["configure"].assert_called_once_with("CID-123", "TOK-9", "MRC_VM")
+        mocks["start"].assert_called_once()
+        # A debian FakeDistro selects the .deb installer URL.
+        self.assertEqual(
+            "https://example.com/falcon.deb",
+            mocks["download"].call_args.args[0],
+        )
+
+    @mock.patch.object(cc_crowdstrike, "_get_el_version", return_value="9")
+    def test_resolves_el_version_for_rpm_distro(self, m_ver):
+        mocks = self._run_handle(
+            copy.deepcopy(NECTAR_DOC),
+            distro=FakeDistro(name="rocky", osfamily="redhat"),
+        )
+        self.assertEqual(
+            "https://example.com/falcon.el9.rpm",
+            mocks["download"].call_args.args[0],
+        )
+
+    def test_skips_when_no_config(self):
+        mocks = self._run_handle({})
+        mocks["download"].assert_not_called()
+        mocks["configure"].assert_not_called()
+        mocks["start"].assert_not_called()
+
+    def test_skips_when_disabled(self):
+        doc = copy.deepcopy(NECTAR_DOC)
+        doc["nectar"]["crowdstrike"]["enabled"] = False
+        mocks = self._run_handle(doc)
+        mocks["configure"].assert_not_called()
+        mocks["start"].assert_not_called()

@@ -103,6 +103,16 @@ FALCON_INSTALLED_MARKER = "/opt/CrowdStrike"
 # single installer_url_rpm cover el8/el9/el10 without per-version config.
 EL_VERSION_PLACEHOLDER = "{el_version}"
 
+# cloud-init does not expose the raw, nested vendor_data2 document to modules
+# (see _fetch_vendordata2 for why), so we read it ourselves from the OpenStack
+# metadata service. This is the well-known link-local base URL, used when the
+# datasource does not report its own metadata address.
+DEFAULT_METADATA_URL = "http://169.254.169.254"
+
+# Path to the dynamic vendordata document under the metadata service. Nova
+# serves "latest" as the newest supported metadata version.
+VENDOR_DATA2_PATH = "openstack/latest/vendor_data2.json"
+
 
 def _is_falcon_installed() -> bool:
     """Check if CrowdStrike Falcon is already installed.
@@ -364,8 +374,73 @@ def _start_falcon_service(distro) -> None:
         raise RuntimeError(msg) from e
 
 
+def _fetch_vendordata2(cloud: Cloud) -> dict:
+    """Fetch and parse the raw ``vendor_data2.json`` document.
+
+    cloud-init does not surface the nested vendor_data2 JSON to modules:
+
+    - ``datasource.get_vendordata2()`` returns a processed MIME message (the
+      output of the user-data handler pipeline), never a dict.
+    - The OpenStack datasource runs the document through
+      ``sources.convert_vendordata`` first, which for a dict returns only its
+      ``cloud-init`` key. Nova's dynamic vendordata always nests our payload
+      under a target name (``nectar``), so the whole document collapses to
+      ``None`` before any module runs.
+
+    We therefore read the document ourselves from the OpenStack metadata
+    service, the same source Nova serves dynamic vendordata from. The base URL
+    is taken from the datasource when available and otherwise falls back to the
+    well-known link-local address.
+
+    Args:
+        cloud: Cloud-init cloud object
+
+    Returns:
+        The parsed document as a dict, or an empty dict if it cannot be
+        retrieved or is not a JSON object.
+    """
+    ds = cloud.datasource
+
+    # The metadata service base URL is known to cloud-init: the OpenStack
+    # datasource records it as ``metadata_address``. Fall back to the
+    # well-known link-local address only when it is absent (e.g. a
+    # config-drive-only datasource, which never sets it).
+    base = getattr(ds, "metadata_address", None) or DEFAULT_METADATA_URL
+    url = base.rstrip("/") + "/" + VENDOR_DATA2_PATH
+
+    # Reuse the datasource's own retry/timeout policy when it exposes one, so
+    # we behave like cloud-init's metadata reads rather than inventing values.
+    timeout, retries = 10, 3
+    try:
+        url_params = ds.get_url_params()
+        timeout = url_params.timeout_seconds
+        retries = url_params.num_retries
+    except Exception:
+        pass
+
+    try:
+        response = url_helper.readurl(
+            url=url, timeout=timeout, retries=retries, sec_between=2
+        )
+    except Exception as e:
+        LOG.debug("Could not fetch vendor_data2 from %s: %s", url, e)
+        return {}
+
+    try:
+        # load_json enforces a dict root and decodes bytes; a non-object
+        # document raises TypeError, which we treat as "no config".
+        return util.load_json(response.contents)
+    except Exception as e:
+        LOG.warning("Could not parse vendor_data2 JSON from %s: %s", url, e)
+        return {}
+
+
 def _get_vendor_data_config(cloud: Cloud) -> dict:
     """Extract CrowdStrike config from vendor_data2.nectar.crowdstrike.
+
+    Reads the raw ``vendor_data2.json`` document (see ``_fetch_vendordata2``)
+    and returns the CrowdStrike settings from ``nectar.crowdstrike``, falling
+    back to a top-level ``crowdstrike`` key for backwards compatibility.
 
     Args:
         cloud: Cloud-init cloud object
@@ -373,31 +448,24 @@ def _get_vendor_data_config(cloud: Cloud) -> dict:
     Returns:
         Dictionary with CrowdStrike configuration, or empty dict if not found
     """
-    try:
-        # Access vendor_data2 from the datasource
-        vendor_data = cloud.datasource.get_vendordata2()
+    vendor_data = _fetch_vendordata2(cloud)
 
-        if vendor_data and isinstance(vendor_data, dict):
-            # Check nested structure: vendor_data2.nectar.crowdstrike
-            nectar_data = vendor_data.get("nectar", {})
-            if nectar_data and isinstance(nectar_data, dict):
-                crowdstrike_cfg = nectar_data.get("crowdstrike", {})
-                if crowdstrike_cfg:
-                    LOG.debug("Found CrowdStrike config in vendor_data2.nectar")
-                    return crowdstrike_cfg
+    if isinstance(vendor_data, dict):
+        # Production structure: vendor_data2.nectar.crowdstrike, where "nectar"
+        # is the Nova dynamic-vendordata target name.
+        nectar_data = vendor_data.get("nectar")
+        if isinstance(nectar_data, dict) and nectar_data.get("crowdstrike"):
+            LOG.debug("Found CrowdStrike config in vendor_data2.nectar")
+            return nectar_data["crowdstrike"]
 
-            # Fallback: check top-level for backwards compatibility
-            crowdstrike_cfg = vendor_data.get("crowdstrike", {})
-            if crowdstrike_cfg:
-                LOG.debug("Found CrowdStrike config in vendor_data2 (top-level)")
-                return crowdstrike_cfg
+        # Fallback: top-level "crowdstrike" key for backwards compatibility.
+        crowdstrike_cfg = vendor_data.get("crowdstrike")
+        if crowdstrike_cfg:
+            LOG.debug("Found CrowdStrike config in vendor_data2 (top-level)")
+            return crowdstrike_cfg
 
-        LOG.debug("No CrowdStrike config found in vendor_data2")
-        return {}
-
-    except Exception as e:
-        LOG.warning("Failed to retrieve vendor_data2: %s", e)
-        return {}
+    LOG.debug("No CrowdStrike config found in vendor_data2")
+    return {}
 
 
 def handle(name: str, cfg: dict, cloud: Cloud, args: list) -> None:

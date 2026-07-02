@@ -8,6 +8,7 @@ cloudinit modules here, before any test imports cc_crowdstrike, so the suite
 runs without a real cloud-init installation.
 """
 
+import json
 import sys
 import types
 from unittest import mock
@@ -24,6 +25,16 @@ def _install_fake_cloudinit():
     def get_cfg_option_bool(cfg, key, default=False):
         return bool(cfg.get(key, default))
 
+    def load_json(text, root_types=(dict,)):
+        # Mirror cloudinit.util.load_json: decode bytes and enforce the root
+        # type (default dict), so non-object documents raise like the real one.
+        if isinstance(text, (bytes, bytearray)):
+            text = text.decode("utf-8")
+        decoded = json.loads(text)
+        if not isinstance(decoded, tuple(root_types)):
+            raise TypeError("unexpected root type %s" % type(decoded))
+        return decoded
+
     subp = types.ModuleType("cloudinit.subp")
     subp.ProcessExecutionError = type("ProcessExecutionError", (Exception,), {})
     subp.which = mock.MagicMock()
@@ -32,9 +43,16 @@ def _install_fake_cloudinit():
     util = types.ModuleType("cloudinit.util")
     util.get_cfg_option_str = get_cfg_option_str
     util.get_cfg_option_bool = get_cfg_option_bool
+    util.load_json = load_json
     util.write_file = mock.MagicMock()
     util.logexc = mock.MagicMock()
     util.get_linux_distro = mock.MagicMock(return_value=("", "", ""))
+
+    temp_utils = types.ModuleType("cloudinit.temp_utils")
+    temp_utils.tempdir = mock.MagicMock()
+
+    url_helper = types.ModuleType("cloudinit.url_helper")
+    url_helper.readurl = mock.MagicMock()
 
     type_utils = types.ModuleType("cloudinit.type_utils")
     type_utils.obj_name = lambda obj: type(obj).__name__
@@ -55,9 +73,9 @@ def _install_fake_cloudinit():
         "cloudinit": types.ModuleType("cloudinit"),
         "cloudinit.subp": subp,
         "cloudinit.util": util,
-        "cloudinit.temp_utils": types.ModuleType("cloudinit.temp_utils"),
+        "cloudinit.temp_utils": temp_utils,
         "cloudinit.type_utils": type_utils,
-        "cloudinit.url_helper": types.ModuleType("cloudinit.url_helper"),
+        "cloudinit.url_helper": url_helper,
         "cloudinit.cloud": cloud_mod,
         "cloudinit.config": types.ModuleType("cloudinit.config"),
         "cloudinit.config.schema": schema_mod,
