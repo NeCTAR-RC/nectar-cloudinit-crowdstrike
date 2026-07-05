@@ -200,6 +200,68 @@ class ConfigureFalconTest(testtools.TestCase):
         self.assertRaises(RuntimeError, cc_crowdstrike._configure_falcon, "CID-12")
 
 
+class InstallPackageTest(testtools.TestCase):
+    PKG = "/tmp/fake-crowdstrike/falcon-sensor.deb"
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_deb_success_uses_dpkg_only(self, m_subp):
+        cc_crowdstrike._install_package(FakeDistro(), self.PKG, "deb")
+        m_subp.assert_called_once_with(["dpkg", "-i", self.PKG], capture=False)
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_deb_unmet_dependencies_recovered_by_apt(self, m_subp):
+        # dpkg -i exits non-zero on unmet dependencies; apt-get install -f
+        # must then run to pull them in and complete the configuration.
+        m_subp.side_effect = [cc_crowdstrike.subp.ProcessExecutionError(), None]
+        cc_crowdstrike._install_package(FakeDistro(), self.PKG, "deb")
+        self.assertEqual(
+            [
+                mock.call(["dpkg", "-i", self.PKG], capture=False),
+                mock.call(["apt-get", "install", "-f", "-y"], capture=False),
+            ],
+            m_subp.call_args_list,
+        )
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_deb_raises_when_apt_recovery_fails(self, m_subp):
+        m_subp.side_effect = cc_crowdstrike.subp.ProcessExecutionError()
+        self.assertRaises(
+            RuntimeError,
+            cc_crowdstrike._install_package,
+            FakeDistro(),
+            self.PKG,
+            "deb",
+        )
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_rpm_success_uses_rpm_only(self, m_subp):
+        cc_crowdstrike._install_package(FakeDistro(), self.PKG, "rpm")
+        m_subp.assert_called_once_with(["rpm", "-ivh", self.PKG], capture=False)
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_rpm_failure_recovered_by_yum(self, m_subp):
+        m_subp.side_effect = [cc_crowdstrike.subp.ProcessExecutionError(), None]
+        cc_crowdstrike._install_package(FakeDistro(), self.PKG, "rpm")
+        self.assertEqual(
+            [
+                mock.call(["rpm", "-ivh", self.PKG], capture=False),
+                mock.call(["yum", "localinstall", "-y", self.PKG], capture=False),
+            ],
+            m_subp.call_args_list,
+        )
+
+    @mock.patch.object(cc_crowdstrike.subp, "subp")
+    def test_rpm_raises_when_yum_recovery_fails(self, m_subp):
+        m_subp.side_effect = cc_crowdstrike.subp.ProcessExecutionError()
+        self.assertRaises(
+            RuntimeError,
+            cc_crowdstrike._install_package,
+            FakeDistro(),
+            self.PKG,
+            "rpm",
+        )
+
+
 # --- Fixtures for the vendor_data2 read path and handle() ------------------
 
 # A realistic vendor_data2.json as delivered by Nova dynamic vendordata: the

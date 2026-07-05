@@ -274,14 +274,17 @@ def _install_package(distro, package_path: str, package_type: str) -> None:
     try:
         if package_type == "deb":
             # Use dpkg for direct package installation
-            cmd = ["dpkg", "-i", package_path]
-            subp.subp(cmd, capture=False)
-
-            # Fix any dependency issues
             try:
-                subp.subp(["apt-get", "install", "-f", "-y"], capture=False)
-            except subp.ProcessExecutionError as e:
-                LOG.warning("apt-get install -f returned non-zero: %s", e)
+                cmd = ["dpkg", "-i", package_path]
+                subp.subp(cmd, capture=False)
+            except subp.ProcessExecutionError:
+                # dpkg exits non-zero on unmet dependencies, leaving the
+                # package unpacked but unconfigured. apt-get install -f
+                # pulls in the missing dependencies and completes the
+                # configuration.
+                LOG.debug("dpkg installation failed, trying apt-get install -f")
+                cmd = ["apt-get", "install", "-f", "-y"]
+                subp.subp(cmd, capture=False)
 
         elif package_type == "rpm":
             # Use rpm or yum for installation
